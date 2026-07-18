@@ -5,62 +5,20 @@
 #include <Library/BaseMemoryLib.h>
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiRuntimeServicesTableLib.h>
-#include <Library/UefiBootManagerLib.h>
 #include <Library/DevicePathLib.h>
 #include <Library/MemoryAllocationLib.h>
 #include <Library/PrintLib.h>
 
-#include <Protocol/DevicePath.h>
+#include <Protocol/LoadedImage.h>
+#include <Protocol/SimpleFileSystem.h>
 
 STATIC CONST EFI_GUID gMicrosoftVendorGuid =
     {0x77fa9abd, 0x0359, 0x4d32, {0xbd, 0x60, 0x28, 0xf4, 0xe7, 0x8f, 0x78, 0x4b}};
 
 STATIC CONST CHAR16 mVbsVarName[] = L"VbsPolicyDisabled";
-
-// 原项目少了 RUNTIME_ACCESS，某些固件/场景下不稳，补上
 #define VBS_VAR_ATTR (EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS)
 
-STATIC CONST CHAR16 mWinBootFile[] = L"BOOTMGFW.EFI";
-#define WIN_BOOT_FILE_LEN 12
-
 STATIC CONST CHAR16 mWinBootFullPath[] = L"\\EFI\\Microsoft\\Boot\\bootmgfw.efi";
-
-STATIC
-BOOLEAN
-IsWindowsBootFile(
-    IN CHAR16 *PathName
-)
-{
-    UINTN Len;
-    UINTN Index;
-    CHAR16 CharA, CharB;
-
-    if (PathName == NULL) {
-        return FALSE;
-    }
-
-    Len = StrLen(PathName);
-    if (Len < WIN_BOOT_FILE_LEN) {
-        return FALSE;
-    }
-
-    PathName += (Len - WIN_BOOT_FILE_LEN);
-
-    for (Index = 0; Index < WIN_BOOT_FILE_LEN; Index++) {
-        CharA = PathName[Index];
-        CharB = mWinBootFile[Index];
-
-        if (CharA >= L'a' && CharA <= L'z') {
-            CharA -= (L'a' - L'A');
-        }
-
-        if (CharA != CharB) {
-            return FALSE;
-        }
-    }
-
-    return TRUE;
-}
 
 STATIC
 VOID
@@ -75,9 +33,7 @@ DisableVBS(
 
     Status = gRT->GetVariable((CHAR16 *)mVbsVarName,
                              (EFI_GUID *)&gMicrosoftVendorGuid,
-                             NULL,
-                             &Size,
-                             &CurrentValue);
+                             NULL, &Size, &CurrentValue);
 
     if (!EFI_ERROR(Status) && CurrentValue == TargetValue) {
         Print(L"[Info] VBS already disabled.\n");
@@ -91,7 +47,6 @@ DisableVBS(
                              &TargetValue);
 
     if (EFI_ERROR(Status)) {
-        // 某些固件需要先 delete 再 set
         gRT->SetVariable((CHAR16 *)mVbsVarName, (EFI_GUID *)&gMicrosoftVendorGuid, 0, 0, NULL);
         Status = gRT->SetVariable((CHAR16 *)mVbsVarName,
                                  (EFI_GUID *)&gMicrosoftVendorGuid,
@@ -100,155 +55,135 @@ DisableVBS(
                                  &TargetValue);
     }
 
-    if (EFI_ERROR(Status)) {
-        Print(L"[Error] VBS Disable failed: %r\n", Status);
-    } else {
-        Print(L"[Info] VBS Disable succeeded: %r\n", Status);
-    }
+    Print(EFI_ERROR(Status)
+          ? L"[Error] VBS Disable failed: %r\n"
+          : L"[Info] VBS Disable succeeded: %r\n",
+          Status);
 }
 
-// 从某个 BootOption 的“设备路径部分”拼出 \EFI\Microsoft\Boot\bootmgfw.efi 并启动
+// 尝试连接控制器，很多固件需要这步才能把磁盘/FS驱动挂上来
 STATIC
-EFI_STATUS
-StartBootmgfwFromBootOption(
-    IN EFI_HANDLE ImageHandle,
-    IN EFI_BOOT_MANAGER_LOAD_OPTION *Opt
+VOID
+ConnectAllControllersBestEffort(
+    VOID
 )
 {
     EFI_STATUS Status;
+    EFI_HANDLE *Handles = NULL;
+    UINTN Count = 0;
+    UINTN i;
+
+    Status = gBS->LocateHandleBuffer(AllHandles, NULL, NULL, &Count, &Handles);
+    if (EFI_ERROR(Status) || Handles == NULL) {
+        Print(L"[Diag] LocateHandleBuffer(AllHandles) failed: %r\n", Status);
+        return;
+    }
+
+    for (i = 0; i < Count; i++) {
+        // ignore error
+        gBS->ConnectController(Handles[i], NULL, NULL, TRUE);
+    }
+
+    FreePool(Handles);
+    Print(L"[Diag] ConnectController(all) done.\n");
+}
+
+STATIC
+EFI_STATUS
+TryStartBootmgfwOnFsHandle(
+    IN EFI_HANDLE ImageHandle,
+    IN EFI_HANDLE FsHandle
+)
+{
+    EFI_STATUS Status;
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *Sfs;
+    EFI_FILE_PROTOCOL *Root = NULL;
+    EFI_FILE_PROTOCOL *File = NULL;
+    EFI_DEVICE_PATH_PROTOCOL *Dp = NULL;
     EFI_HANDLE WinImage = NULL;
 
-    EFI_DEVICE_PATH_PROTOCOL *Node;
-    EFI_DEVICE_PATH_PROTOCOL *DevicePartEnd = NULL;
-    EFI_DEVICE_PATH_PROTOCOL *DevicePart = NULL;
-    EFI_DEVICE_PATH_PROTOCOL *WinPath = NULL;
-    EFI_DEVICE_PATH_PROTOCOL *FilePart = NULL;
-
-    if (Opt == NULL || Opt->FilePath == NULL) {
-        return EFI_INVALID_PARAMETER;
+    Status = gBS->HandleProtocol(FsHandle, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Sfs);
+    if (EFI_ERROR(Status)) {
+        return Status;
     }
 
-    // 找到第一个 FILEPATH 节点，把它作为截断点：之前是“设备路径”，之后是文件路径
-    Node = Opt->FilePath;
-    while (!IsDevicePathEnd(Node)) {
-        if (DevicePathType(Node) == MEDIA_DEVICE_PATH &&
-            DevicePathSubType(Node) == MEDIA_FILEPATH_DP) {
-            DevicePartEnd = Node;
-            break;
-        }
-        Node = NextDevicePathNode(Node);
+    Status = Sfs->OpenVolume(Sfs, &Root);
+    if (EFI_ERROR(Status)) {
+        return Status;
     }
 
-    if (DevicePartEnd != NULL) {
-        UINTN Size = (UINTN)((UINT8*)DevicePartEnd - (UINT8*)Opt->FilePath);
-        DevicePart = AllocateCopyPool(Size + END_DEVICE_PATH_LENGTH, Opt->FilePath);
-        if (DevicePart == NULL) {
-            return EFI_OUT_OF_RESOURCES;
-        }
-        SetDevicePathEndNode((EFI_DEVICE_PATH_PROTOCOL *)((UINT8*)DevicePart + Size));
-    } else {
-        // 没有 FILEPATH 节点就退化为整条路径（不一定好用，但比什么都不做强）
-        DevicePart = DuplicateDevicePath(Opt->FilePath);
-        if (DevicePart == NULL) {
-            return EFI_OUT_OF_RESOURCES;
-        }
+    Status = Root->Open(Root, &File, (CHAR16 *)mWinBootFullPath, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(Status)) {
+        Root->Close(Root);
+        return EFI_NOT_FOUND;
     }
 
-    // 构造文件路径节点
-    FilePart = FileDevicePath(NULL, (CHAR16 *)mWinBootFullPath);
-    if (FilePart == NULL) {
-        FreePool(DevicePart);
+    File->Close(File);
+    Root->Close(Root);
+
+    Print(L"[Boot] Found: %s\n", mWinBootFullPath);
+
+    Dp = FileDevicePath(FsHandle, (CHAR16 *)mWinBootFullPath);
+    if (Dp == NULL) {
+        Print(L"[Error] FileDevicePath failed.\n");
         return EFI_OUT_OF_RESOURCES;
     }
 
-    // 拼接设备路径 + 文件路径
-    WinPath = AppendDevicePath(DevicePart, FilePart);
-
-    FreePool(DevicePart);
-    FreePool(FilePart);
-
-    if (WinPath == NULL) {
-        Print(L"[Error] AppendDevicePath failed.\n");
-        return EFI_OUT_OF_RESOURCES;
-    }
-
-    Print(L"[Boot] Fallback: LoadImage %s\n", mWinBootFullPath);
-
-    Status = gBS->LoadImage(FALSE, ImageHandle, WinPath, NULL, 0, &WinImage);
+    Status = gBS->LoadImage(FALSE, ImageHandle, Dp, NULL, 0, &WinImage);
     Print(L"[Boot] LoadImage returned: %r\n", Status);
-
-    if (!EFI_ERROR(Status)) {
-        Status = gBS->StartImage(WinImage, NULL, NULL);
-        Print(L"[Boot] StartImage returned: %r\n", Status);
+    if (EFI_ERROR(Status)) {
+        FreePool(Dp);
+        return Status;
     }
 
-    FreePool(WinPath);
+    // 关键诊断：StartImage 的返回码
+    Status = gBS->StartImage(WinImage, NULL, NULL);
+    Print(L"[Boot] StartImage returned: %r\n", Status);
+
+    FreePool(Dp);
     return Status;
 }
 
 STATIC
-VOID
-BootWindows(
+EFI_STATUS
+BootWindowsBySearchingAllFileSystems(
     IN EFI_HANDLE ImageHandle
 )
 {
-    EFI_BOOT_MANAGER_LOAD_OPTION *BootOptions;
-    UINTN BootOptionCount;
-    UINTN Index;
+    EFI_STATUS Status;
+    EFI_HANDLE *Handles = NULL;
+    UINTN HandleCount = 0;
+    UINTN i;
 
-    EFI_DEVICE_PATH_PROTOCOL *Node;
-    FILEPATH_DEVICE_PATH *FilePathNode;
-    BOOLEAN Found;
+    Print(L"[Boot] Searching all file systems for %s\n", mWinBootFullPath);
 
-    BootOptions = EfiBootManagerGetLoadOptions(&BootOptionCount, LoadOptionTypeBoot);
-    if (BootOptions == NULL) {
-        Print(L"[Error] EfiBootManagerGetLoadOptions returned NULL.\n");
-        return;
+    Status = gBS->LocateHandleBuffer(ByProtocol,
+                                     &gEfiSimpleFileSystemProtocolGuid,
+                                     NULL,
+                                     &HandleCount,
+                                     &Handles);
+    Print(L"[Diag] LocateHandleBuffer(SimpleFileSystem) => %r, Count=%u\n", Status, (UINT32)HandleCount);
+
+    if (EFI_ERROR(Status) || Handles == NULL || HandleCount == 0) {
+        return EFI_NOT_FOUND;
     }
 
-    for (Index = 0; Index < BootOptionCount; Index++) {
-        if ((BootOptions[Index].Attributes & LOAD_OPTION_ACTIVE) == 0) {
-            continue;
+    for (i = 0; i < HandleCount; i++) {
+        Print(L"[Diag] Try FS handle %u/%u ...\n", (UINT32)(i+1), (UINT32)HandleCount);
+        Status = TryStartBootmgfwOnFsHandle(ImageHandle, Handles[i]);
+
+        // 如果成功交接，通常不会返回；如果返回 EFI_SUCCESS 也说明它返回了（异常但我们认为它成功过）
+        if (!EFI_ERROR(Status)) {
+            FreePool(Handles);
+            return Status;
         }
 
-        Found = FALSE;
-        Node = BootOptions[Index].FilePath;
-
-        while (!IsDevicePathEnd(Node)) {
-            if ((DevicePathType(Node) == MEDIA_DEVICE_PATH) &&
-                (DevicePathSubType(Node) == MEDIA_FILEPATH_DP)) {
-                FilePathNode = (FILEPATH_DEVICE_PATH *)Node;
-                if (IsWindowsBootFile(FilePathNode->PathName)) {
-                    Found = TRUE;
-                    break;
-                }
-            }
-            Node = NextDevicePathNode(Node);
-        }
-
-        if (!Found) {
-            continue;
-        }
-
-        Print(L"[Boot] Windows found: %s\n", BootOptions[Index].Description);
-        Print(L"[Boot] Calling EfiBootManagerBoot...\n");
-
-        // 试图按固件的 Boot#### 正常启动
-        EfiBootManagerBoot(&BootOptions[Index]);
-
-        // 如果能返回到这里，说明没有成功交接（失败或被固件拒绝/返回）
-        Print(L"[Boot] EfiBootManagerBoot returned (handoff failed).\n");
-
-        // 立刻 fallback：从该 BootOption 同一设备上强制启动标准 bootmgfw.efi
-        StartBootmgfwFromBootOption(ImageHandle, &BootOptions[Index]);
-
-        // 无论如何，找到一次就结束，不要继续循环也不要落到“等待按键”
-        EfiBootManagerFreeLoadOptions(BootOptions, BootOptionCount);
-        return;
+        // 继续尝试下一个分区（很关键，避免某个分区有同名文件但不可启动）
+        Print(L"[Diag] This handle failed: %r\n", Status);
     }
 
-    Print(L"[Error] Windows boot loader not found.\n");
-    EfiBootManagerFreeLoadOptions(BootOptions, BootOptionCount);
+    FreePool(Handles);
+    return EFI_NOT_FOUND;
 }
 
 EFI_STATUS
@@ -258,13 +193,18 @@ UefiMain(
     IN EFI_SYSTEM_TABLE *SystemTable
 )
 {
+    EFI_STATUS Status;
     UINTN Index;
     EFI_INPUT_KEY Key;
 
     DisableVBS();
-    BootWindows(ImageHandle);
 
-    // 如果 Windows 启动成功，通常不会再执行到这里
+    // 连接所有控制器，提升找到硬盘ESP的概率
+    ConnectAllControllersBestEffort();
+
+    Status = BootWindowsBySearchingAllFileSystems(ImageHandle);
+    Print(L"[Info] Boot attempt finished: %r\n", Status);
+
     Print(L"\nPress any key to exit...\n");
     gBS->WaitForEvent(1, &gST->ConIn->WaitForKey, &Index);
     gST->ConIn->ReadKeyStroke(gST->ConIn, &Key);
